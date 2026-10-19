@@ -148,6 +148,13 @@ returned argv. Without that variable the integration test is skipped; its gate
 requires an explicit run. Config inspection and a direct client handshake do
 not demonstrate real-agent adoption.
 
+For bounded F reproduction, run
+`bun run scripts/validate-phase-f.ts --artifacts <allowed-cache-base>`; see
+[05c](docs/plans/05c-p4-f-execution-plan.md) for environment-relative commands,
+offline `--self-check`, explicit `--fresh`, evidence gates and acceptance limits.
+Default dependency reuse is not a fresh install. F requires no predecessor
+upgrade or before/after version comparison.
+
 ## Diagnose Codex and observe requests
 
 Run doctor through the stable absolute invocation:
@@ -200,8 +207,12 @@ Destination failure is reported safely on stderr. Audit never uses MCP stdout.
 - P4 E doctor, metadata/audit, and actual Codex-selected AST call:
   `PHASE_ACCEPTED` by final major reviewer PASS; E3-01 is resolved by the
   user-terminal native run and independently verified retained evidence.
-- A–E are accepted; F has not run, so P4 completion is not claimed.
-  Bounded evidence and preservation provenance are recorded in [05b](docs/plans/05b-p4-de-execution-plan.md).
+- P4 F cross-workspace and host acceptance: `PHASE_ACCEPTED` by the controller,
+  as requested by the operator, after test and retained native-host evidence
+  verification. A–F are accepted for the Codex user-scope stdio integration.
+  [05c](docs/plans/05c-p4-f-execution-plan.md) owns the F acceptance matrix,
+  evidence provenance and host-enforcement limits;
+  [05b](docs/plans/05b-p4-de-execution-plan.md) retains A–E evidence.
 - LSP mutation, semantic retrieval, provider supervision, and cross-MCP
   transactions: deferred or out of scope.
 

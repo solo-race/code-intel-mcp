@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Client, type CallToolResult } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
@@ -53,7 +54,7 @@ async function fixture() {
 async function connect(context: Awaited<ReturnType<typeof fixture>>, fixedRoot?: string) {
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: ["run", resolve("index.ts"), ...(fixedRoot === undefined ? ["serve"] : ["--workspace-root", fixedRoot])],
+    args: ["run", fileURLToPath(new URL("../index.ts", import.meta.url)), ...(fixedRoot === undefined ? ["serve"] : ["--workspace-root", fixedRoot])],
     cwd: context.cwd,
     // Fixed-root tests use an empty PATH: no real provider is reachable.
     env: { ...process.env, PATH: fixedRoot === undefined ? context.providers : context.cwd },
@@ -201,6 +202,110 @@ describe("request-routed stdio MCP", () => {
     expect(await readFile(join(context.a, "sample.ts"), "utf8")).toBe(drifted);
     expect(content(await apply(client, bId)).applied).toBe(true);
     expect(await readFile(join(context.b, "sample.ts"), "utf8")).toBe(changed);
+  }, 30_000);
+
+  test("isolates parallel A/B searches and previews through interleaved ID-only applies", async () => {
+    const context = await fixture();
+    const { client } = await connect(context);
+    const bSource = "const value = compute(2);\n";
+    const bChanged = "const value = compute(2).memo();\n";
+    await writeFile(join(context.b, "sample.ts"), bSource);
+    const aPostcondition = { kind: "ast_match_count", pattern: "compute(1).memo()", expectedCount: 1 };
+    const bPostcondition = { kind: "ast_match_count", pattern: "compute(2).memo()", expectedCount: 1 };
+    const [aSearch, bSearch, aPreview, bPreview, staleBPreview] = await Promise.all([
+      client.callTool({ name: "ast_search", arguments: { workspaceRoot: context.a, path: "sample.ts", pattern: "compute(1)" } }),
+      client.callTool({ name: "ast_search", arguments: { workspaceRoot: context.b, path: "sample.ts", pattern: "compute(2)" } }),
+      client.callTool({ name: "ast_transform_preview", arguments: {
+        ...transformation, workspaceRoot: context.a, verification: { postconditions: [aPostcondition] },
+      } }),
+      client.callTool({ name: "ast_transform_preview", arguments: {
+        ...transformation, workspaceRoot: context.b, verification: { postconditions: [bPostcondition] },
+      } }),
+      client.callTool({ name: "ast_edit_preview", arguments: { ...edit, workspaceRoot: context.b } }),
+    ]);
+    expect(content(aSearch).totalMatches).toBe(1);
+    expect(content(bSearch).totalMatches).toBe(1);
+    const aId = identity(aPreview);
+    const bId = identity(bPreview);
+    const staleBId = identity(staleBPreview);
+    expect(new Set([aId, bId, staleBId]).size).toBe(3);
+    const frozenA = { ...aPostcondition, path: await realpath(join(context.a, "sample.ts")) };
+    const frozenB = { ...bPostcondition, path: await realpath(join(context.b, "sample.ts")) };
+    expect(content(aPreview)).toMatchObject({ applied: false, verification: { postconditions: [frozenA] } });
+    expect(content(bPreview)).toMatchObject({ applied: false, verification: { postconditions: [frozenB] } });
+    expect(content(staleBPreview).applied).toBe(false);
+    expect(await readFile(join(context.a, "sample.ts"))).toEqual(Buffer.from(source));
+    expect(await readFile(join(context.b, "sample.ts"))).toEqual(Buffer.from(bSource));
+
+    // Select the opposite root immediately before each ID-only apply.
+    expect(content(await client.callTool({ name: "ast_search", arguments: {
+      workspaceRoot: context.a, path: "sample.ts", pattern: "compute(1)",
+    } })).totalMatches).toBe(1);
+    expect(content(await apply(client, bId))).toMatchObject({
+      applied: true, previewId: bId, workspaceRoot: await realpath(context.b),
+      verification: { status: "passed", results: [{ ...frozenB, actualCount: 1 }] },
+    });
+    expect(await readFile(join(context.a, "sample.ts"))).toEqual(Buffer.from(source));
+    expect(await readFile(join(context.b, "sample.ts"))).toEqual(Buffer.from(bChanged));
+
+    const replayB = await apply(client, bId);
+    expect(replayB.isError).toBe(true);
+    expect(JSON.stringify(replayB)).toContain("PREVIEW_ALREADY_USED");
+    const staleB = await apply(client, staleBId);
+    expect(staleB.isError).toBe(true);
+    expect(JSON.stringify(staleB)).toContain("STALE_PREVIEW");
+    expect(await readFile(join(context.a, "sample.ts"))).toEqual(Buffer.from(source));
+    expect(await readFile(join(context.b, "sample.ts"))).toEqual(Buffer.from(bChanged));
+
+    expect(content(await client.callTool({ name: "ast_search", arguments: {
+      workspaceRoot: context.b, path: "sample.ts", pattern: "compute(2).memo()",
+    } })).totalMatches).toBe(1);
+    // Neither consuming B nor rejecting B's other identities consumes A.
+    expect(content(await apply(client, aId))).toMatchObject({
+      applied: true, previewId: aId, workspaceRoot: await realpath(context.a),
+      verification: { status: "passed", results: [{ ...frozenA, actualCount: 1 }] },
+    });
+    const replayA = await apply(client, aId);
+    expect(replayA.isError).toBe(true);
+    expect(JSON.stringify(replayA)).toContain("PREVIEW_ALREADY_USED");
+    expect(await readFile(join(context.a, "sample.ts"))).toEqual(Buffer.from(changed));
+    expect(await readFile(join(context.b, "sample.ts"))).toEqual(Buffer.from(bChanged));
+    expect(await readFile(join(context.cwd, "sample.ts"))).toEqual(Buffer.from(source));
+  }, 30_000);
+
+  test("rejects an invalid late plan step before issuing usable identities or applying the valid early step", async () => {
+    const context = await fixture();
+    const { client } = await connect(context);
+    const lateTarget = join(context.a, "late.ts");
+    await writeFile(lateTarget, source);
+    const rejected = await client.callTool({ name: "ast_transform_plan_preview", arguments: {
+      workspaceRoot: context.a,
+      steps: [transformation, {
+        ...transformation, path: "late.ts", operations: [edit.operations[0]!, edit.operations[0]!],
+      }],
+    } });
+    expect(rejected.isError).toBe(true);
+    expect(JSON.stringify(rejected)).toContain("DUPLICATE_PATTERN");
+    const failure = rejected.structuredContent as {
+      previewId?: unknown; results?: unknown[]; completedResults?: unknown[];
+    } | undefined;
+    expect(failure?.previewId).toBeUndefined();
+    expect(failure?.results ?? []).toEqual([]);
+    expect(failure?.completedResults ?? []).toEqual([]);
+    for (const root of [context.a, context.b, context.cwd]) {
+      expect(await readFile(join(root, "sample.ts"))).toEqual(Buffer.from(source));
+    }
+    expect(await readFile(lateTarget)).toEqual(Buffer.from(source));
+
+    // The early step is independently valid; the rejected plan exposed no such ID.
+    const early = await client.callTool({ name: "ast_transform_preview", arguments: {
+      ...transformation, workspaceRoot: context.a,
+    } });
+    identity(early);
+    expect(content(early)).toMatchObject({ applied: false, totalReplacements: 1 });
+    expect(await readFile(join(context.a, "sample.ts"))).toEqual(Buffer.from(source));
+    expect(await readFile(join(context.b, "sample.ts"))).toEqual(Buffer.from(source));
+    expect(await readFile(lateTarget)).toEqual(Buffer.from(source));
   }, 30_000);
 
   test("routes a whole plan to one root and preserves independent partial-preview identities", async () => {
